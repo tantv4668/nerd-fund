@@ -10,6 +10,12 @@ contract NerdFund is Ownable, Pausable {
 
     IERC20 public iERC20;
 
+    struct RoundInfo {
+        uint256 project1;
+        uint256 project2;
+        uint256 project3;
+    }
+
     struct ProjectInfo {
         uint256 projectId;
         string name;
@@ -17,83 +23,250 @@ contract NerdFund is Ownable, Pausable {
         string imageLink;
         string dataLink;
         uint256 fund;
-        uint256 completeNumber;
     }
 
-    ProjectInfo[] public projects;
+    RoundInfo[] private _rounds;
+    mapping(uint256 => ProjectInfo[]) private _projectInRound;
+    mapping(address => mapping(uint256 => mapping(uint256 => uint256))) private _userInfo; // user address => round => projectId => UserInfo
+    mapping(address => uint256) public lastClaim;
+    mapping(address => bool) private _blacklist;
 
-    uint256 public completeFund;
+    event AddProject(uint256 indexed roundId, uint256 indexed projectId, string name);
 
-    event AddProject(uint256 indexed id, string name);
+    event Complete(uint256 indexed roundId, uint256 project1, uint256 project2, uint256 project3);
 
-    event Fund(address indexed funder, uint256 indexed projectId, uint256 amount);
+    event Fund(
+        address indexed user,
+        uint256 indexed roundId,
+        uint256[] projectIds,
+        uint256[] amounts
+    );
 
-    event Complete(uint256 indexed projectId, uint256 time);
-
-    constructor(address _erc20, uint256 _completeFund) {
-        require(_completeFund >= 0, "Nerd fund: invalid argument");
-
+    constructor(address _erc20) {
         iERC20 = IERC20(_erc20);
-
-        completeFund = _completeFund;
     }
 
     function addProject(
-        string memory _name,
-        string memory _description,
-        string memory _imageLink,
-        string memory _dataLink
+        string[] memory _names,
+        string[] memory _descriptions,
+        string[] memory _imageLinks,
+        string[] memory _dataLinks
     ) public onlyOwner whenNotPaused {
-        ProjectInfo memory newProject = ProjectInfo({
-            projectId: projects.length,
-            name: _name,
-            description: _description,
-            imageLink: _imageLink,
-            dataLink: _dataLink,
-            fund: 0,
-            completeNumber: 0
-        });
+        require(
+            _names.length == _descriptions.length &&
+                _descriptions.length == _imageLinks.length &&
+                _imageLinks.length == _dataLinks.length,
+            "Invalid parameters"
+        );
 
-        projects.push(newProject);
+        for (uint256 i = 0; i < _names.length; i++) {
+            uint256 _round = _rounds.length;
+            ProjectInfo memory newProject = ProjectInfo({
+                projectId: _projectInRound[_round].length,
+                name: _names[i],
+                description: _descriptions[i],
+                imageLink: _imageLinks[i],
+                dataLink: _dataLinks[i],
+                fund: 0
+            });
 
-        emit AddProject(projects.length - 1, _name);
-    }
-
-    function getAllProjects() public view returns (ProjectInfo[] memory projectsInfo) {
-        projectsInfo = new ProjectInfo[](projects.length);
-
-        for (uint256 i = 0; i < projects.length; i++) {
-            projectsInfo[i] = projects[i];
+            _projectInRound[_round].push(newProject);
+            emit AddProject(_round, _projectInRound[_round].length - 1, _names[i]);
         }
     }
 
-    function updateCompleteFund(uint256 _completeFund) public onlyOwner whenNotPaused {
-        completeFund = _completeFund;
+    function getAllProjectsInRound(uint256 _round)
+        public
+        view
+        returns (ProjectInfo[] memory projectsInfo)
+    {
+        require(_round <= _rounds.length, "Invalid round");
+        projectsInfo = new ProjectInfo[](_projectInRound[_round].length);
+
+        for (uint256 i = 0; i < _projectInRound[_round].length; i++) {
+            projectsInfo[i] = _projectInRound[_round][i];
+        }
     }
 
-    function fund(uint256 _projectId, uint256 _amount) public whenNotPaused {
-        require(_projectId < projects.length, "Nerd fund: invalid projectId");
-
-        iERC20.safeTransferFrom(msg.sender, address(this), _amount);
-
-        projects[_projectId].fund += _amount;
-
-        emit Fund(msg.sender, _projectId, _amount);
+    function getProject(uint256 _round, uint256 _projectId)
+        public
+        view
+        returns (ProjectInfo memory)
+    {
+        require(_round <= _rounds.length, "Invalid round");
+        require(_projectId < _projectInRound[_round].length, "Invalid projectId");
+        return _projectInRound[_round][_projectId];
     }
 
-    function complete(uint256 _projectId) public onlyOwner {
-        require(_projectId < projects.length, "Nerd fund: invalid projectId");
+    function fund(uint256[] memory _projectIds, uint256[] memory _amounts) public whenNotPaused {
+        require(_blacklist[msg.sender] == false, "You are blocked");
+        require(_projectIds.length == _amounts.length, "Invalid parameters");
 
-        require(projects[_projectId].fund >= completeFund, "Nerd: Fund is not enough");
+        uint256 total = 0;
+        uint256 _round = _rounds.length;
+        for (uint256 i = 0; i < _projectIds.length; i++) {
+            require(_projectIds[i] < _projectInRound[_round].length, "Invalid projectId");
+            require(_amounts[i] > 0, "Invalid amount");
 
-        iERC20.safeTransfer(msg.sender, projects[_projectId].fund);
+            total = total + _amounts[i];
 
-        uint256 time = projects[_projectId].completeNumber;
+            _userInfo[msg.sender][_round][_projectIds[i]] += _amounts[i];
 
-        projects[_projectId].fund = 0;
-        projects[_projectId].completeNumber += 1;
+            _projectInRound[_round][_projectIds[i]].fund += _amounts[i];
+        }
 
-        emit Complete(_projectId, time);
+        iERC20.safeTransferFrom(msg.sender, address(this), total);
+
+        emit Fund(msg.sender, _round, _projectIds, _amounts);
+    }
+
+    function getUserInfo(address _user, uint256 _round) public view returns (uint256[] memory) {
+        require(_round <= _rounds.length, "Invalid round");
+
+        uint256[] memory info = new uint256[](_projectInRound[_round].length);
+
+        for (uint256 i = 0; i < _projectInRound[_round].length; i++) {
+            info[i] = _userInfo[_user][_round][i];
+        }
+
+        return info;
+    }
+
+    function complete(
+        uint256 _project1,
+        uint256 _project2,
+        uint256 _project3
+    ) public whenNotPaused onlyOwner {
+        uint256 _round = _rounds.length;
+
+        uint256 totalAmount = _projectInRound[_round][_project1].fund +
+            _projectInRound[_round][_project2].fund +
+            _projectInRound[_round][_project3].fund;
+
+        iERC20.safeTransfer(msg.sender, totalAmount);
+
+        _rounds.push(RoundInfo({project1: _project1, project2: _project2, project3: _project3}));
+
+        emit Complete(_round, _project1, _project2, _project3);
+    }
+
+    function claim() public whenNotPaused {
+        require(_blacklist[msg.sender] == false, "You are blocked");
+        require(lastClaim[msg.sender] < _rounds.length, "Already claimed");
+
+        uint256 total;
+
+        for (uint256 i = lastClaim[msg.sender]; i < _rounds.length; i++) {
+            for (uint256 j = 0; j < _projectInRound[i].length; j++)
+                if (
+                    j != _rounds[i].project1 &&
+                    j != _rounds[i].project2 &&
+                    j != _rounds[i].project3 &&
+                    _userInfo[msg.sender][i][j] > 0
+                ) {
+                    total = total + _userInfo[msg.sender][i][j];
+                }
+        }
+
+        lastClaim[msg.sender] = _rounds.length;
+
+        if (total > 0) {
+            iERC20.safeTransfer(msg.sender, total);
+        }
+    }
+
+    function claimTo(uint256 _to) public whenNotPaused {
+        require(_blacklist[msg.sender] == false, "You are blocked");
+        require(_to < _rounds.length, "Invalid to parameter");
+        require(lastClaim[msg.sender] <= _to, "Already claimed");
+
+        uint256 total;
+
+        for (uint256 i = lastClaim[msg.sender]; i <= _to; i++) {
+            for (uint256 j = 0; j < _projectInRound[i].length; j++)
+                if (
+                    j != _rounds[i].project1 &&
+                    j != _rounds[i].project2 &&
+                    j != _rounds[i].project3 &&
+                    _userInfo[msg.sender][i][j] > 0
+                ) {
+                    total = total + _userInfo[msg.sender][i][j];
+                }
+        }
+
+        lastClaim[msg.sender] = _to + 1;
+
+        if (total > 0) {
+            iERC20.safeTransfer(msg.sender, total);
+        }
+    }
+
+    function getClaimableAmount(address _user) public view returns (uint256) {
+        uint256 total;
+
+        for (uint256 i = lastClaim[_user]; i < _rounds.length; i++) {
+            for (uint256 j = 0; j < _projectInRound[i].length; j++)
+                if (
+                    j != _rounds[i].project1 &&
+                    j != _rounds[i].project2 &&
+                    j != _rounds[i].project3 &&
+                    _userInfo[_user][i][j] > 0
+                ) {
+                    total = total + _userInfo[_user][i][j];
+                }
+        }
+
+        return total;
+    }
+
+    function switchFund(uint256[] memory _projectIds, uint256[] memory _amounts)
+        public
+        whenNotPaused
+    {
+        require(_blacklist[msg.sender] == false, "You are blocked");
+        require(_projectIds.length == _amounts.length, "Invalid Parameters");
+        require(lastClaim[msg.sender] < _rounds.length, "Already claimed");
+
+        uint256 total;
+        for (uint256 i = lastClaim[msg.sender]; i < _rounds.length; i++) {
+            for (uint256 j = 0; j < _projectInRound[i].length; j++)
+                if (
+                    j != _rounds[i].project1 &&
+                    j != _rounds[i].project2 &&
+                    j != _rounds[i].project3 &&
+                    _userInfo[msg.sender][i][j] > 0
+                ) {
+                    total = total + _userInfo[msg.sender][i][j];
+                }
+        }
+
+        require(total > 0, "Invalid switchFund");
+
+        lastClaim[msg.sender] = _rounds.length;
+
+        uint256 _round = _rounds.length;
+
+        for (uint256 i = 0; i < _projectIds.length; i++) {
+            require(_projectIds[i] < _projectInRound[_round].length, "Invalid projectId");
+            require(_amounts[i] > 0, "Invalid amount");
+            require(total >= _amounts[i], "Not enough token");
+
+            total = total - _amounts[i];
+
+            _userInfo[msg.sender][_round][_projectIds[i]] += _amounts[i];
+
+            _projectInRound[_round][_projectIds[i]].fund += _amounts[i];
+        }
+
+        if (total > 0) {
+            iERC20.safeTransfer(msg.sender, total);
+        }
+
+        emit Fund(msg.sender, _round, _projectIds, _amounts);
+    }
+
+    function round() public view returns (uint256) {
+        return _rounds.length;
     }
 
     function pause() public onlyOwner {
@@ -102,6 +275,10 @@ contract NerdFund is Ownable, Pausable {
 
     function unpause() public onlyOwner {
         _unpause();
+    }
+
+    function blockUser(address _user) public onlyOwner {
+        _blacklist[_user] = true;
     }
 
     function withdraw(address _token) public onlyOwner {
